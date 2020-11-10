@@ -1,48 +1,20 @@
-#### simulates viral integrations ####
-
-#### written by Suzanne Scott (suzanne.scott@csiro.au) and Susie Grigson (susie.grigson@flinders.edu) ####
-
-# types of possible integrations:
-## whole viral genome (possibility for reverse orientation)
-## portion of viral genome (possibility for reverse orientation)
-## n sequential portions of viral genome, rearranged (with possibility that some are reversed)
-## n non-sequential (with a gap in between) portions of viral genome, rearranged (with possibility that some are reversed) (ie deletion)
-## portion of viral genome divided into n sequential portions of viral genome, rearranged 
-## poriton of viral genome divided into n non-sequential portions of viral genome and rearranged 
-
-# at each integration type, overlaps possible are gap, overlap, none
-## if gap, insert small number of random bases between host and virus
-## if overlap, take small (<=10) number of bases and look for homology, do integration there
-## if none, there is a 'clean' junction between virus and host
-
-# reports parameters of integrations:
-	#location in host genome (chr, start, stop)
-	#part of viral genome inserted (virus, start, stop)
-	#integration type (whole, portion, rearrangement, etc)
-	#overlaps/gaps at each junction 
-# reports all integration sites relative to the host genome, independent of other integrations
-# intergrations are stored internally though the Integration class
-
 ###import libraries
 from Bio import SeqIO
 from Bio.Alphabet.IUPAC import unambiguous_dna
 from Bio.Seq import Seq 
 from Bio.SeqRecord import SeqRecord
-from scipy.stats import poisson
 import pandas as pd
 import argparse
 from sys import argv
 from os import path
 import numpy as np
-import scipy
 import pdb 
 import csv
 import re
 import pprint
-import time
 
 ###
-max_attempts = 200 #maximum number of times to try to place an integration site 
+max_attempts = 50 #maximum number of times to try to place an integration site 
 
 default_ints = 5
 default_epi = 0
@@ -56,13 +28,13 @@ default_p_gap = 0.3
 default_lambda_junction = 3
 default_p_host_del = 0.0
 default_lambda_host_del = 1000
-default_min_sep = 500
 
 search_length_overlap = 10000 # number of bases to search either side of randomly generated position for making overlaps
 
-lambda_junc_percentile = 0.99
-
 fasta_extensions = [".fa", ".fna", ".fasta"]
+
+min_sep = 1 # TODO - min_sep is command line argument
+
 
 pp = pprint.PrettyPrinter(indent=4)
 
@@ -87,10 +59,6 @@ def main(argv):
 	parser.add_argument('--epi_info', help = 'output tsv with info about episomes', type=str, default="episomes.tsv")	
 	parser.add_argument('--seed', help = 'seed for random number generator', default=12345, type=int)
 	parser.add_argument('--verbose', help = 'display extra output for debugging', action="store_true")
-	parser.add_argument('--model-check', help = 'check integration model every new integration', action="store_true")
-	parser.add_argument('--min-sep', help='minimum separation for integrations', type=int, default=default_min_sep)
-	parser.add_argument('--min-len', help='minimum length of integrated viral fragments', type=int, default=None)
-
 	args = parser.parse_args()
 	
 	#### generate integrations ####		
@@ -109,12 +77,10 @@ def main(argv):
 	# initialise Events
 	if args.verbose is True:
 		print("initialising a new Events object")
-
-	seqs = Events(args.host, args.virus, seed=args.seed, verbose = True, min_len = args.min_len)
+	seqs = Events(args.host, args.virus, seed=args.seed, verbose = True)
 	
 	# add integrations
-	seqs.add_integrations(probs, args.int_num, max_attempts, 
-												model_check = args.model_check, min_sep = args.min_sep)
+	seqs.add_integrations(probs, args.int_num, max_attempts)	
 	seqs.add_episomes(probs, args.epi_num, max_attempts)
 	
 	
@@ -132,9 +98,7 @@ class Events(dict):
 	are episomal (present in sequence data but not integrated into the host chromosomes)
 	"""
 	
-	def __init__(self, host_fasta_path, virus_fasta_path, 
-								fasta_extensions = ['.fa', '.fna', '.fasta'], 
-								seed = 12345, verbose = False, min_len = None):
+	def __init__(self, host_fasta_path, virus_fasta_path, fasta_extensions = ['.fa', '.fna', '.fasta'], seed = 12345, verbose = False):
 		"""
 		initialise events class by importing a host and viral fasta, and setting up the random number generator
 		"""
@@ -143,28 +107,24 @@ class Events(dict):
 		assert isinstance(fasta_extensions, list)
 		assert isinstance(seed, int)
 		assert isinstance(verbose, bool)
-		assert isinstance(min_len, int) or min_len is None
-		if min_len is not None:
-			assert min_len > 0
 		
 		self.verbose = verbose
-		self.min_len = min_len
 		
 		# check and import fasta files
 		if self.verbose is True:
-			print("importing host fasta", flush=True)
+			print("importing host fasta")
 	
 		# read host fasta - use index which doesn't load sequences into memory because host is large genome
 		if self.checkFastaExists(host_fasta_path, fasta_extensions):
-			self.host = SeqIO.to_dict(SeqIO.parse(host_fasta_path, 'fasta', alphabet=unambiguous_dna))
+			self.host = SeqIO.index(host_fasta_path, 'fasta', alphabet=unambiguous_dna)
 		else:
 			raise OSError("Could not open host fasta")
 		
 		if self.verbose is True:
-			print(f"imported host fasta with {len(self.host)} chromosomes:", flush=True)
+			print(f"imported host fasta with {len(self.host)} chromosomes:")
 			host_chrs = {key:len(self.host[key]) for key in self.host.keys()}
 			for key, length in host_chrs.items():
-				print(f"\thost chromosome '{key}' with length {length}", flush=True)
+				print(f"\thost chromosome '{key}' with length {length}") 
 	
 		# read virus fasta -  make dictionary in memory of sequences
 		if self.checkFastaExists(virus_fasta_path, fasta_extensions):
@@ -174,25 +134,17 @@ class Events(dict):
 				this_virus.seq = this_virus.seq.upper()
 		else:
 			raise OSError("Could not open virus fasta")
-			
-		# check that minimum length is greater than the length of all the viral references
-		if self.min_len is not None:
-			if not all([len(virus) >= self.min_len for virus in self.virus.values()]):
-				raise ValueError(f"specified minimum length is more than the length of one of the input viruses")
-			if any([len(virus) == self.min_len for virus in self.virus.values()]):
-				print(f"warning: minimum length is equal to the length of one or more references - integrations involving these references will all be whole, regardless of p_whole")
-
 
 		if self.verbose is True:
-			print(f"imported virus fasta with {len(self.virus)} sequences:", flush=True)
+			print(f"imported virus fasta with {len(self.virus)} sequences:")
 			virus_seqs = {key:len(self.virus[key]) for key in self.virus.keys()}
 			for key, length in virus_seqs.items():
-				print(f"\tviral sequence '{key}' with length {length}", flush=True)
-			
+				print(f"\tviral sequence '{key}' with length {length}") 
+				
 		# instantiate random number generator
 		self.rng = np.random.default_rng(seed)
 		
-	def add_integrations(self, probs, int_num, max_attempts = 50, model_check = False, min_sep = 1):
+	def add_integrations(self, probs, int_num, max_attempts = 50):
 		"""
 		Add an Integrations object with int_num integrations, with types specified by probs,
 		to self
@@ -200,84 +152,58 @@ class Events(dict):
 		
 		assert isinstance(max_attempts, int)
 		assert isinstance(int_num, int)
-		assert isinstance(min_sep, int)
 		assert max_attempts > 0
-		assert int_num >= 0
-		assert min_sep > 0
-		
-		self.min_sep = min_sep
-		self.max_attempts = max_attempts
-		self.model_check = model_check
+		assert int_num > 0
 		
 		# can only add integrations once
 		if 'ints' in self:
 			raise ValueError("integrations have already been added to this Events object") # is there a better error type for this?
 			
-		# check that the number of requested integrations will fit in the host, given the requested minimum separation
-		# rule of thumb is that we allow 4*min_sep for each integration
-		total_host_length = sum([len(seq) for seq in self.host.values()])
-		if self.min_sep * 4 * int_num > total_host_length:
-			raise ValueError("The requested number of integrations, with the specified minimum separation, are not likely to fit into the specified host.  Either decrease the number of integrations or the minimum separation.")
-			
-		# we require that the minimum length of integrations is longer than the integrated virus
-		# so check the value of lambda_junction relative to min_len and the length of the shortest viral reference
-		# require that both are greater than the 99th percentile of the poisson distribution defined by lambda_junction
-		self.check_junction_length(probs)
-			
 		# instantiate Integrations object
-		self.ints = Integrations(self.host, self.virus, probs, self.rng, self.max_attempts, self.model_check, self.min_sep, self.min_len)
+		print(f"integration {len(self)}")
+		self.ints = Integrations(self.host, self.virus, probs, self.rng, max_attempts)
 		
 		# add int_num integrations
 		if self.verbose is True:
-			print(f"performing {int_num} integrations", flush=True)
+			print(f"performing {int_num} integrations")
 		counter = 0
 		while len(self.ints) < int_num:
-			t0 = time.time()
 			if self.ints.add_integration() is False:
 				counter += 1
 			# check for too many attempts
 			if counter > max_attempts:
 				raise ValueError('too many failed attempts to add integrations')
-			t1 = time.time()
-			print(f"added integration {len(self.ints)} in {(t1-t0):.2f}s", flush=True)
-			print()
+		
 		# if we had fewer than 50% of our attempts left
 		if (counter / max_attempts) > 0.5:
-			print(f"warning: there were {counter} failed integrations", flush=True)
+			print(f"warning: there were {counter} failed integrations")
 				
 	def add_episomes(self, probs, epi_num, max_attepmts = 50):
 		"""
 		Add an Integrations object with int_num integrations, with types specified by probs,
 		to self
 		"""
-		
 		assert isinstance(max_attempts, int)
 		assert isinstance(epi_num, int)
 		assert max_attempts > 0
-		assert epi_num >= 0
+		assert epi_num > 0
 		
 		# can only add episomes once
 		if 'epis' in self:
 			raise ValueError("episomes have already been added to this Events object")
 			
-		# we require that the minimum length of integrations is longer than the integrated virus
-		# so check the value of lambda_junction relative to min_len and the length of the shortest viral reference
-		# require that both are greater than the 99th percentile of the poisson distribution defined by lambda_junction
-		self.check_junction_length(probs)
-			
 		# instantiate Episomes object
-		self.epis = Episomes(self.virus, self.rng, probs, max_attempts, self.min_len)
+		self.epis = Episomes(self.virus, self.rng, probs, max_attempts)
 		
 		# add epi_num episomes
 		if self.verbose is True:
-			print(f"adding {epi_num} episomes", flush=True)
+			print(f"adding {epi_num} episomes")
 		counter = 0
 		while len(self.epis) < epi_num:
 			if self.epis.add_episome() is False:
 				counter += 1
 			if counter > max_attempts:
 				raise ValueError('too many failed attempts to add episomes')
-
 			
 	def checkFastaExists(self, file, fasta_extensions):
 		#check file exists
@@ -291,67 +217,46 @@ class Events(dict):
 				return False
 		return True		
 		
-	def check_junction_length(self, probs):
-		"""
-		we require that the minimum length of integrations is longer than the integrated virus
-		so check the value of lambda_junction relative to min_len and the length of the shortest viral reference
-		require that both are greater than the 99th percentile of the poisson distribution defined by lambda_junction
-		"""
-
-		thresh = poisson.ppf(lambda_junc_percentile, probs['lambda_junction'])
-		if self.min_len is not None:
-			if thresh * 2  > self.min_len:
-				raise ValueError(
-					"There is likely to be a lot of clashes in which the length of the left and right junctions, and the \
-					length of the integrations.  Set a shorter lambda_jucntion or a longer minimum length"
-					)
-		if thresh * 2  > min([len(virus) for virus in  self.virus.values()]):
-			raise ValueError(
-				"There is likely to be a lot of clashes in which the length of the left and right junctions, and the \
-				length of the integrations.  Set a shorter lambda_jucntion or use longer viral references."
-				)
-		
 	def save_fasta(self, file):
 		"""
 		save output sequences to file
 		"""
 
 		if 'ints' in vars(self):
-			assert len(self.ints) >= 0
+			assert len(self.ints) != 0
 			self.ints._Integrations__save_fasta(file, append = False)
 		
 		if 'epis' in vars(self):
-			assert len(self.epis) >= 0
+			assert len(self.epis) != 0
 			self.epis._Episomes__save_fasta(file, append = True)
 			
 		if ('ints' not in vars(self)) and ('epis' not in vars(self)):
-			print("warning: no integrations or episomes have been added" , flush=True)
+			print("warning: no integrations or episomes have been added")
 			
 		if self.verbose is True:
-			print(f"saved fasta with integrations and episomes to {file}", flush=True)
+			print(f"saved fasta with integrations and episomes to {file}")
 			
 	def save_integrations_info(self, file):
 		"""
 		save info about integrations to file
 		"""
-		assert len(self.ints) >= 0
+		assert len(self.ints) != 0
 		
 		self.ints._Integrations__save_info(file)
 		
 		if self.verbose is True:
-			print(f"saved inforamtion about integrations to {file}", flush=True)
+			print(f"saved inforamtion about integrations to {file}")
 		
 	def save_episomes_info(self, file):
 		"""
 		save info about episomes to file
 		"""
-		assert 'epis' in vars(self)
-		assert len(self.epis) >= 0
+		assert len(self.epis) != 0
 		
 		self.epis._Episomes__save_info(file)
 		
 		if self.verbose is True:
-			print(f"saved information about episomes to {file}", flush=True)
+			print(f"saved information about episomes to {file}")
 		
 class Integrations(list):
 	"""
@@ -380,9 +285,9 @@ class Integrations(list):
 	
 	p_host_del - probability that there will be a deletion from the host at integration site
 	lambda_host_del - mean of poisson distribution of number of bases deleted from host genome at integration site
-
+	
 	"""
-	def __init__(self, host, virus, probs, rng, max_attempts=50, model_check=False, min_sep=1, min_len=None):
+	def __init__(self, host, virus, probs, rng, max_attempts=50):
 		"""
 		Function 
 		to initialise Integrations object
@@ -391,14 +296,7 @@ class Integrations(list):
 		# checks for inputs
 		assert isinstance(virus, dict)
 		assert isinstance(probs, dict)
-		assert isinstance(max_attempts, int)
 		assert max_attempts > 0
-		assert isinstance(model_check, bool)
-		assert isinstance(min_sep, int)
-		assert min_sep > 0
-		assert isinstance(min_len, int) or min_len is None
-		if min_len is not None:
-			assert min_len > 0
 		
 		# assign properties common to all integrations
 		self.host = host
@@ -406,9 +304,6 @@ class Integrations(list):
 		self.probs = probs
 		self.rng = rng
 		self.max_attempts = max_attempts
-		self.model_check = model_check
-		self.min_sep = min_sep
-		self.min_len = min_len
 		
 		# default values for probs
 		self.set_probs_default('p_whole', default_p_whole)
@@ -451,6 +346,7 @@ class Integrations(list):
 		# this is to be updated every time we do an integration
 
 		self.model = {chr : [{'origin': 'host', 'coords':(0, len(seq)), "ori" : "+", 'seq_name': chr}] for chr, seq in host.items()}
+	
 			
 
 	def set_probs_default(self, key, default):
@@ -495,8 +391,6 @@ class Integrations(list):
 				return n
 			counter += 1
 			if counter > self.max_attempts:
-				print(f"warning: too many attempts to get value with minimum {min} and maximum {max} from poisson distribution with mean {lambda_poisson}", flush=True)
-				
 				return None
 					
 	def add_integration(self):
@@ -505,40 +399,21 @@ class Integrations(list):
 		"""
 			
 		# call functions that randomly set properties of this integrations
-		counter = 0
-		while True:
-			chunk_props = self.set_chunk_properties()
-			if len(chunk_props) != 0:
-				break
-			counter += 1
-			if counter > self.max_attempts:
-				raise ValueError("too many attempts to set chunk properties")
-		assert len(chunk_props) == 5
+		chunk_props = self.set_chunk_properties()
+		assert len(chunk_props) == 4
 			
-		counter = 0
-		while True:
-			junc_props = self.set_junc_properties()
-			if len(junc_props) != 0:
-				break
-			counter += 1
-			if counter > self.max_attempts:
-				raise ValueError("too many attempts to set junction properties")
-		
+		junc_props = self.set_junc_properties()
 		assert len(junc_props) == 4
 
 		# make an integration
-		t0 = time.time()
 		integration = Integration(self.host, 
 								  self.virus,
 								  model = self.model,
 								  rng = self.rng,
 								  int_id = len(self),
 								  chunk_props = chunk_props,
-								  junc_props = junc_props,
-								  min_sep = self.min_sep
+								  junc_props = junc_props
 								  )
-		t1 = time.time()
-		print(f"made integration in {t1-t0}s", flush=True)
 		
 		# append to self if nothing went wrong with this integration
 		if integration.chunk.pieces is not None:
@@ -547,10 +422,7 @@ class Integrations(list):
 				
 				self.append(integration)
 				
-				t0 = time.time()
 				self.__update_model(integration)
-				t1 = time.time()
-				print(f"updated model in {t1-t0}s")
 				
 				return True
 				
@@ -578,8 +450,6 @@ class Integrations(list):
 			n_left_junc = 0
 		elif junc_props['junc_types'][0] in ['gap', 'overlap']:
 			n_left_junc = self.poisson_with_minimum_and_maximum(self.probs['lambda_junction'], min = 1)
-			if n_left_junc is None:
-				return {}
 		else:
 			return {}
 			
@@ -588,8 +458,6 @@ class Integrations(list):
 			n_right_junc = 0
 		elif junc_props['junc_types'][1] in ['gap', 'overlap']:
 			n_right_junc = self.poisson_with_minimum_and_maximum(self.probs['lambda_junction'], min = 1)
-			if n_right_junc is None:
-				return {}
 		else:
 			return {}
 		
@@ -610,8 +478,6 @@ class Integrations(list):
 		# if we're doing a host deletion, get number of bases to be deleted
 		if junc_props['host_del'] is True:
 			junc_props['host_del_len'] = self.poisson_with_minimum_and_maximum(self.probs['lambda_host_del'], min = 1)
-			if junc_props['host_del_len'] is None:
-				return {}
 		elif junc_props['host_del'] is False:
 			junc_props['host_del_len'] = 0
 		else:
@@ -629,8 +495,6 @@ class Integrations(list):
 			- n_fragments: number of fragments into which ViralChunk should be split
 			- n_delete: number of fragments to delete from ViralChunk (should always leave at least two fragments after deletion)
 			- n_swaps: number of swaps to make when rearranging ViralChunk
-			- min_len: the minimum length of the viral chunk - optional (if not present, for integration will be set to
-							the number of overlap bases + 1, for episome will be set to 1
 		"""
 		
 		chunk_props = {}
@@ -649,6 +513,7 @@ class Integrations(list):
 		is_delete = bool(self.rng.choice(a = [True, False], p = [self.probs['p_delete'], p_not_delete]))
 		
 		# get number of fragments - ignored if both isDelete and isRearrange are both False
+		
 		# must have at least two pieces for a rearrangment, or three for a deletion
 		min_split = 1
 		if is_rearrange is True:
@@ -674,13 +539,8 @@ class Integrations(list):
 		# if we're doing a rearrangement, get the number of swaps to make
 		if is_rearrange is True:
 			chunk_props['n_swaps'] = self.poisson_with_minimum_and_maximum(self.probs['lambda_split'], min = 1)
-			if chunk_props['n_swaps'] is None:
-				return {}
 		else:
 			chunk_props['n_swaps'] = 0
-			
-		# set minimum length of chunk
-		chunk_props['min_len'] = self.min_len
 			
 		return chunk_props
 		
@@ -695,7 +555,6 @@ class Integrations(list):
 			if integration.pos >= seg['coords'][0] and integration.pos <= seg['coords'][1]:
 				break
 		
-		t0 = time.time()
 		# remove this element from the list
 		seg = self.model[integration.chr].pop(i)
 		host_start = seg['coords'][0]
@@ -715,7 +574,7 @@ class Integrations(list):
 		assert host['coords'][1] > host['coords'][0]
 		self.model[integration.chr].insert(i, host)
 		i += 1
-
+		
 		# if we have ambiguous bases at the left junction, add these to the list too
 		assert len(integration.junc_props['junc_bases'][0]) == integration.junc_props['n_junc'][0]
 		if integration.junc_props['junc_types'][0] in ['gap', 'overlap']:
@@ -739,7 +598,7 @@ class Integrations(list):
 			assert ambig['coords'][1] > ambig['coords'][0]
 			self.model[integration.chr].insert(i, ambig)
 			i += 1
-
+		
 		# add each piece of the viral chunk too
 		for j in range(len(integration.chunk.pieces)):
 			virus = {'origin': 'virus', 
@@ -750,7 +609,6 @@ class Integrations(list):
 			self.model[integration.chr].insert(i, virus)
 			i += 1
 			
-		t0 = time.time()	
 		# if we have ambiguous bases at the right junction, add these
 		assert len(integration.junc_props['junc_bases'][1]) == integration.junc_props['n_junc'][1]
 		if integration.junc_props['junc_types'][1] in ['gap', 'overlap']:
@@ -781,11 +639,9 @@ class Integrations(list):
 			assert ambig['coords'][1] > ambig['coords'][0]
 			self.model[integration.chr].insert(i, ambig)
 			i += 1
-		
 			
 		# finally, add second portion of host
 		host = {'origin': 'host', 'seq_name': integration.chr, 'ori': '+'}
-		
 		
 		# accounting for bases deleted from the host and overlaps
 		# note that integration.pos is always to the left of any overlapped bases, so here is where we need to account for them
@@ -795,17 +651,7 @@ class Integrations(list):
 		self.model[integration.chr].insert(i, host)
 		i += 1		
 		
-		if self.model_check is True:
-			self.__check_model()
-		
-	
-	def __check_model(self):
-		"""
-		check model is valid by checking various properties
-		"""
-		n_ints = 0
-		next_int = True
-		t0 = time.time()
+		# check model is still valid
 		for chr in self.model.keys():
 			host_pos = 0
 			for seg in self.model[chr]:
@@ -813,16 +659,12 @@ class Integrations(list):
 				assert seg['origin'] in ('host', 'virus', 'ambig')
 				assert 'seq_name' in seg
 				if seg['origin'] == 'host':
-					next_int = True
 					assert seg['seq_name'] == chr
 					assert seg['ori'] == '+'
 					# check that host position is only increasing
 					assert seg['coords'][0] >= host_pos
 					host_pos = seg['coords'][1]
-				elif seg['origin'] == 'virus':
-					if next_int is True:
-						n_ints += 1
-						next_int = False	
+				elif seg['origin'] == 'virus':	
 					assert seg['seq_name'] in list(self.virus.keys())
 				elif seg['origin'] == 'ambig':
 					assert 'bases' in seg
@@ -831,9 +673,6 @@ class Integrations(list):
 						host_bases = str(self.host[chr][seg['coords'][0]:seg['coords'][1]].seq).lower()
 						seg_bases = seg['bases'].lower()
 						assert host_bases == seg_bases
-		assert n_ints == len(self)
-		t1 = time.time()
-		print(f"checked model validity in {t1-t0}s")	
 	
 	def __save_fasta(self, filename, append = False):
 		"""
@@ -907,7 +746,6 @@ class Integrations(list):
 		previous_ints = {key:0 for key in self.host.keys()}
 		deleted_bases = {key:0 for key in self.host.keys()}
 		
-		self.__check_model()
 		self.sort()
 			
 		with open(filename, "w", newline='') as csvfile:
@@ -935,7 +773,7 @@ class Integrations(list):
 				deleted_bases[integration.chr] += integration.junc_props['host_del_len']
 
 				# format lists into comma-separated strings
-				breakpoints = ";".join([str(i) for i in integration.chunk.pieces])
+				breakpoints = ",".join([str(i) for i in integration.chunk.pieces])
 				oris = ','.join(integration.chunk.oris)
 				junc_types = ",".join(integration.junc_props['junc_types'])
 				junc_bases = ",".join(integration.junc_props['junc_bases'])
@@ -978,7 +816,8 @@ class Episomes(Integrations):
 	Since Integrations and Episomes use some similar methods, this class inherits from Integrations
 	in order to avoid duplication
 	"""
-	def __init__(self, virus, rng, probs, max_attempts = 50, min_len = None):
+	
+	def __init__(self, virus, rng, probs, max_attempts = 50, ):
 		"""
 		initialises an empty Episomes list, storing the properties common to all episomes
 		"""
@@ -986,19 +825,12 @@ class Episomes(Integrations):
 		assert isinstance(virus, dict)
 		assert isinstance(probs, dict)
 		assert isinstance(max_attempts, int)
-		assert isinstance(min_len, int) or min_len is None
-		if min_len is None:
-			min_len = 1
-		else:
-			assert min_len > 0
-		
 	
 		# assign properties common to all episomes
 		self.virus = virus
 		self.probs = probs
 		self.rng = rng
 		self.max_attempts = max_attempts
-		self.min_len = min_len
 		
 		# default values for probs
 		self.set_probs_default('p_whole', default_p_whole)
@@ -1024,6 +856,7 @@ class Episomes(Integrations):
 		"""
 		get a viral chunk and add to self
 		"""
+		
 		
 		# call functions that randomly set properties of this integrations
 		chunk_props = self.set_chunk_properties()
@@ -1088,7 +921,7 @@ class Episomes(Integrations):
 		 - n_delete: number of pieces deleted from chunk
 		
 		"""
-		assert len(self) >= 0
+		assert len(self) > 0
 		
 		# define header
 		
@@ -1125,7 +958,7 @@ class Integration(dict):
 	
 	This class is intended to be used by the Integrations class, which is essentially a list of Integration objects
 	"""
-	def __init__(self, host, virus, model, rng, int_id, chunk_props, junc_props, min_sep):
+	def __init__(self, host, virus, model, rng, int_id, chunk_props, junc_props):
 		"""
 		Function to initialise Integration object
 		portionType is 'whole' or 'portion' - the part of the virus that has been inserted
@@ -1162,6 +995,7 @@ class Integration(dict):
 		
 		after assigning a 
 		"""
+		
 		# assign chunk_props and junc_props to self
 		self.chunk_props = chunk_props
 		self.junc_props = junc_props
@@ -1199,19 +1033,16 @@ class Integration(dict):
 			assert junc_props['host_del_len'] == 0
 		
 		assert search_length_overlap > 0 and isinstance(search_length_overlap, int)
-		
-		assert isinstance(min_sep, int)
-		assert min_sep > 1
 			
 		# set parameters that won't be changed
 		self.search_length_overlap = search_length_overlap
 		self.id = int_id
 	
-		# get random chromosome on which to do integration
+		# get random chromosome on which to do insertion
 		self.chr = str(rng.choice(list(host.keys())))
 		
 		# set minimum length for viral chunk - longer than the number of bases involved in the junction
-		if self.chunk_props['min_len'] is None:
+		if 'min_len' not in self.chunk_props:
 			self.chunk_props['min_len'] = self.n_overlap_bases() + 1
 		if self.chunk_props['min_len'] < self.n_overlap_bases() + 1:
 			self.chunk_props['min_len'] = self.n_overlap_bases() + 1
@@ -1237,26 +1068,21 @@ class Integration(dict):
 
 		
 		# number of bases in overlaps must be less than the length of the integrated chunk
-		if self.n_overlap_bases() >= len(self.chunk.bases):
-			self.pos = None
-			return
+		assert self.n_overlap_bases() < len(self.chunk.bases)
 		
 		# set bases belonging to junction
 		self.junc_props['junc_bases'] = (self.get_junc_bases(rng, 'left'), self.get_junc_bases(rng, 'right'))
-
 		
 		# get a position at which to integrate
-		pos_success = self.get_int_position(host[self.chr].seq, rng, model, min_sep)
+		pos_success = self.get_int_position(host[self.chr].seq, rng, model)
 		if pos_success is False:
 			self.pos = None
 			return
 		
 		# number of bases deleted from host chromosome
-		
 		if junc_props['host_del'] is False:
 			self.host_deleted = 0 
 		else:
-
 			self.host_deleted = junc_props['host_del_len']
 			
 			# but only delete up to the length of the segment in which this integration occurs, 
@@ -1267,13 +1093,11 @@ class Integration(dict):
 				if not self.has_overlap(self.pos, self.pos, seg['coords'][0], seg['coords'][1]):
 					continue
 			
-				# are we trying to delete past the end of the segment?		
+				# are we trying to delete past the end of the segment?
 				if self.pos + self.host_deleted + self.n_overlap_bases() >= (seg['coords'][1] - min_sep):
 					self.host_deleted = seg['coords'][1] - self.pos - min_sep - self.n_overlap_bases()
-					self.junc_props['host_del_len'] = self.host_deleted
 					if self.host_deleted < 0:
-						self.pos = None
-						return
+						raise ValueError('host deleted is less than zero')
 				break
 			
 		# double check for valid chunk
@@ -1284,8 +1108,6 @@ class Integration(dict):
 		assert len(self.junc_props['junc_bases'][1]) == self.junc_props['n_junc'][1]
 		assert all([len(i) == 2 for i in self.chunk.pieces])
 		assert len(self.chunk.pieces) == len(self.chunk.oris)
-		assert all([piece[1] > piece[0] for piece in self.chunk.pieces])
-
 		
 	def n_overlap_bases(self):
 		"""
@@ -1300,7 +1122,7 @@ class Integration(dict):
 			n += self.junc_props['n_junc'][1]
 		return n
 		
-	def get_random_position(self, model, rng, min_sep):
+	def get_random_position(self, model, rng):
 		"""
 		based on current model, get a random position that is available for integration
 		(that is, doesn't already have an integration)
@@ -1328,7 +1150,7 @@ class Integration(dict):
 		# get a random postion from this part
 		return int(rng.choice(range(part[0], part[1])))	
 		
-	def get_int_position(self, chr, rng, model, min_sep):
+	def get_int_position(self, chr, rng, model):
 		"""
 		get a position at which to perform the integration
 		the position depends on the overlap type at each side of the overlap
@@ -1339,14 +1161,14 @@ class Integration(dict):
 
 		# if at both ends the junction is either 'clean' or 'gap', just get a random positon
 		if all([True if (i in ['clean', 'gap']) else False for i in self.junc_props['junc_types']]):
-			self.pos = self.get_random_position(model, rng, min_sep)
+			self.pos = self.get_random_position(model, rng)
 			return True
 			
 		# if overlap at both ends, look for both overlaps in host chromosome next to each other
 		elif self.junc_props['junc_types'][0] == 'overlap' and self.junc_props['junc_types'][1] == 'overlap':
 		
 			# make string with both overlap bases 
-			self.pos = self.find_overlap_bases(self.junc_props['junc_bases'][0] + self.junc_props['junc_bases'][1], chr, rng, model, min_sep)
+			self.pos = self.find_overlap_bases(self.junc_props['junc_bases'][0] + self.junc_props['junc_bases'][1], chr, rng, model)
 			
 			# check for unsuccessful find
 			if self.pos == -1:
@@ -1364,7 +1186,7 @@ class Integration(dict):
 		elif self.junc_props['junc_types'][0] == 'overlap':
 			
 			# find position with overlap at which to do overlap
-			self.pos = self.find_overlap_bases(self.junc_props['junc_bases'][0], chr, rng, model, min_sep)
+			self.pos = self.find_overlap_bases(self.junc_props['junc_bases'][0], chr, rng, model)
 			# check for unsuccessful find
 			if self.pos == -1:
 				self.pos = None
@@ -1379,7 +1201,7 @@ class Integration(dict):
 		elif self.junc_props['junc_types'][1] == 'overlap':
 
 			# find position with overlap at which to do overlap
-			self.pos = self.find_overlap_bases(self.junc_props['junc_bases'][1], chr, rng, model, min_sep)
+			self.pos = self.find_overlap_bases(self.junc_props['junc_bases'][1], chr, rng, model)
 			# check for unsuccessful find
 			if self.pos == -1:
 				self.pos = None
@@ -1395,12 +1217,12 @@ class Integration(dict):
 			
 		return False		
 	
-	def find_overlap_bases(self, overlap_bases, chr, rng, model, min_sep):
+	def find_overlap_bases(self, overlap_bases, chr, rng, model):
 		"""
 		find bases from an overlap in the host chromosome
 		"""
 		# get position around which to search
-		start = self.get_random_position(model, rng, min_sep)
+		start = self.get_random_position(model, rng)
 		
 		# get start and stop positions for bases in host chromosome to search for overlaps
 		stop = start + self.search_length_overlap
@@ -1484,6 +1306,10 @@ class Integration(dict):
 		to_delete = []
 		i = 0
 		while deleted_bases < n:
+			# if we're left with a piece of length 0, flag this piece for deletion
+			if self.chunk.pieces[i][0] == self.chunk.pieces[i][1]:
+				to_delete.append(i)
+				i += 1
 			# if this piece is a forward piece
 			if self.chunk.oris[i] == '+':
 				# detele one base
@@ -1498,12 +1324,8 @@ class Integration(dict):
 				print(f"unrecgonised orientation {self.chunk.oris[i]} in chunk {vars(self.chunk)}")
 				self.pos = None
 				return
-			# if we're left with a piece of length 0, flag this piece for deletion
-			if self.chunk.pieces[i][0] == self.chunk.pieces[i][1]:
-				to_delete.append(i)
-				i += 1
 				
-		# remove chunks that we want to delete
+		# remove chunks that we want to dele
 		self.chunk.pieces = [self.chunk.pieces[i] for i in range(len(self.chunk.pieces)) if (i not in to_delete)]
 		self.chunk.oris = [self.chunk.oris[i] for i in range(len(self.chunk.oris)) if (i not in to_delete)]
 		
@@ -1533,9 +1355,12 @@ class Integration(dict):
 		# adjust breakpoints 		
 		deleted_bases = 0
 		to_delete = []
-		i = len(self.chunk.pieces) - 1 # start at the last piece in the chunk
+		i = 0
 		while deleted_bases < n:
-			assert i >= 0
+			# if we're left with a piece of length 0, flag this piece for deletion
+			if self.chunk.pieces[i][0] == self.chunk.pieces[i][1]:
+				to_delete.append(i)
+				i += 1
 			# if this piece is a forward piece
 			if self.chunk.oris[i] == "+":
 				# delete one base
@@ -1548,11 +1373,7 @@ class Integration(dict):
 			else:
 				print(f"unrecgonised orientation {self.chunk.oris[i]} in chunk {vars(self.chunk)} ")
 				self.pos = None
-				return		
-			# if we're left with a piece of length 0, flag this piece for deletion			
-			if self.chunk.pieces[i][0] == self.chunk.pieces[i][1]:
-				to_delete.append(i)
-				i -= 1
+				return
 				 
 		# remove chunks that we want to delete
 		self.chunk.pieces = [self.chunk.pieces[i] for i in range(len(self.chunk.pieces)) if (i not in to_delete)]
@@ -1647,7 +1468,7 @@ class ViralChunk(dict):
 	Class to store properties of an integrated chunk of virus.  
 	Intended to be used by the Integrations and Episomes classes
 	"""
-
+	
 	def __init__(self, virus,  rng, chunk_props):
 		"""
 		function to get a chunk of a virus
@@ -1671,7 +1492,7 @@ class ViralChunk(dict):
 		assert len(virus) > 0
 
 		assert isinstance(chunk_props, dict)
-		assert len(chunk_props) == 5
+		assert len(chunk_props) > 3 and len(chunk_props) < 6
 		
 		assert 'is_whole' in chunk_props
 		assert isinstance(chunk_props['is_whole'], bool)
@@ -1688,11 +1509,12 @@ class ViralChunk(dict):
 		assert isinstance(chunk_props['n_delete'], int)
 		assert chunk_props['n_delete'] >= 0
 		
-		assert 'min_len' in chunk_props
-		assert isinstance(chunk_props['min_len'], int) or chunk_props['min_len'] is None
-		if chunk_props['min_len'] is None:
+		if len(chunk_props) == 5:
+			assert 'min_len' in chunk_props
+			assert isinstance(chunk_props['min_len'], int)
+			assert chunk_props['min_len'] > 0
+		else:
 			chunk_props['min_len'] = 1
-		assert chunk_props['min_len'] > 0
 		
 		# check that the minimum length specified is longer than all the viruses
 		# otherwise we might fail
@@ -1702,10 +1524,6 @@ class ViralChunk(dict):
 		# get a random virus to integrate
 		self.virus = str(rng.choice(list(virus.keys())))
 		self.chunk_props = chunk_props
-		
-		# if the length of the virus is equal to min_len, is_whole must be true
-		if len(virus[self.virus]) == chunk_props['min_len']:
-			chunk_props['is_whole'] = True
 		
 		if self.chunk_props['is_whole'] is True:
 			self.start = 0
